@@ -3,7 +3,9 @@ import os, re, hmac, hashlib
 import requests
 from flask import Flask, request, abort
 
+import time
 import documentos as D
+import cotizacion as COT
 from documentos import sin_acentos, numero_a_letras
 
 app = Flask(__name__)
@@ -25,7 +27,8 @@ MENU = (
     "1️⃣ Venta al contado (entrega de la moto)\n"
     "2️⃣ Separación (venta al contado, pago parcial)\n"
     "3️⃣ Financiamiento – inicial (separación)\n"
-    "4️⃣ Financiamiento – entrega final (recoge la moto)\n\n"
+    "4️⃣ Financiamiento – entrega final (recoge la moto)\n"
+    "5️⃣ Cotización (moto, moto + accesorios o accesorios)\n\n"
     "Responde con el número."
 )
 
@@ -98,6 +101,46 @@ PAGO 2: FECHA / MONTO / MEDIO / N° OP"""
 PLANTILLA_SEPARACION = _SEPARACION.format(tipo="TIPO: SEPARACIÓN")
 PLANTILLA_FIN_INICIAL = _SEPARACION.format(tipo="TIPO: FINANCIAMIENTO INICIAL")
 
+
+_COT_CABECERA = """FECHA (vacía = hoy):
+CLIENTE:
+DNI / RUC (opcional):
+VENDEDOR (vacío = Nick Sánchez):
+TELÉFONO DEL VENDEDOR (vacío = 925 912 101):
+"""
+
+_COT_MOTO = """
+MOTO
+MARCA:
+MODELO:
+COLOR:
+ETIQUETA (ej. PRE-VENTA, opcional):
+TEXTO DEL PRECIO (opcional, ej. PRECIO DE PREVENTA):
+PRECIO:
+"""
+
+_COT_ACC = """
+ACCESORIOS (CANT / DESCRIPCIÓN / PRECIO UNITARIO)
+ACC 1: CANT / DESCRIPCIÓN / PRECIO UNIT.
+ACC 2: CANT / DESCRIPCIÓN / PRECIO UNIT.
+ACC 3: CANT / DESCRIPCIÓN / PRECIO UNIT.
+DESCUENTO ACCESORIOS (% , opcional):
+INSTALACIÓN 1 (DESCRIPCIÓN / MONTO, opcional): 
+"""
+
+PLANTILLA_COT_MOTO = ("TIPO: COTIZACIÓN MOTO\n" + _COT_CABECERA + _COT_MOTO + """
+REGALOS Y BENEFICIOS
+REGALOS (uno por línea, opcional):
+BONO (monto en soles, opcional):
+INCLUYE (uno por línea, o ESTANDAR):
+TEXTO PRECIO FINAL (opcional):""")
+PLANTILLA_COT_MOTO_ACC = "TIPO: COTIZACIÓN MOTO Y ACCESORIOS\n" + _COT_CABECERA + _COT_MOTO + _COT_ACC
+PLANTILLA_COT_ACC = "TIPO: COTIZACIÓN ACCESORIOS\n" + _COT_CABECERA + _COT_ACC
+
+MENU_COT = ("¿Qué vas a cotizar?\n\n1️⃣ Moto (con regalos y beneficios)\n2️⃣ Moto + accesorios\n"
+            "3️⃣ Solo accesorios\n\nResponde con el número.")
+PLANTILLAS_COT = {"1": PLANTILLA_COT_MOTO, "2": PLANTILLA_COT_MOTO_ACC, "3": PLANTILLA_COT_ACC}
+
 PLANTILLAS = {"1": PLANTILLA_CONTADO, "2": PLANTILLA_SEPARACION,
               "3": PLANTILLA_FIN_INICIAL, "4": PLANTILLA_FIN_FINAL}
 NOMBRES_FLUJO = {"contado": "Venta al contado", "separacion": "Separación (contado)",
@@ -137,8 +180,13 @@ CAMPOS = {
     "REGALIAS": "regalias",
     "BONO 500": "bono", "BONO": "bono",
     "OBSERVACIONES": "observaciones", "OBSERVACION": "observaciones",
+    "CLIENTE": "cliente", "DNI / RUC": "doc_cliente", "DNI/RUC": "doc_cliente", "RUC / DNI": "doc_cliente",
+    "TELEFONO DEL VENDEDOR": "tel_vendedor", "TELEFONO VENDEDOR": "tel_vendedor",
+    "ETIQUETA": "etiqueta", "TEXTO DEL PRECIO": "texto_precio",
+    "REGALOS": "regalos", "INCLUYE": "incluye", "TEXTO PRECIO FINAL": "texto_final",
+    "DESCUENTO ACCESORIOS": "descuento", "DESCUENTO": "descuento",
 }
-ENCABEZADOS = {"COMPRADOR", "MOTO", "PRECIO", "PAGOS", "ENTREGA", "EXTRAS"}
+ENCABEZADOS = {"COMPRADOR", "MOTO", "PRECIO", "PAGOS", "ENTREGA", "EXTRAS", "ACCESORIOS", "REGALOS Y BENEFICIOS"}
 
 def parsear(texto):
     datos, pagos = {}, []
@@ -152,6 +200,16 @@ def parsear(texto):
             etiqueta, valor = l.split(":", 1)
             et = norm_label(etiqueta)
             valor = valor.strip()
+            if re.fullmatch(r"(ACC|ACCESORIO)\s*\d+", et):
+                if valor and not valor.upper().startswith("CANT"):
+                    datos.setdefault("_acc", []).append(valor)
+                ultimo = None
+                continue
+            if re.fullmatch(r"(INSTALACION|INST)\s*\d*", et):
+                if valor and not valor.upper().startswith("DESCRIP"):
+                    datos.setdefault("_inst", []).append(valor)
+                ultimo = None
+                continue
             if re.fullmatch(r"PAGO\s*\d+", et):
                 if valor and valor != "-":
                     pagos.append(valor)
@@ -402,11 +460,173 @@ def firma_valida(req):
 vistos = []
 
 def parece_plantilla(texto):
-    return len(re.findall(r"^\s*[^\n:]{2,45}:", texto, flags=re.M)) >= 5 and "NOMBRE" in sin_acentos(texto.upper())
+    t = sin_acentos(texto.upper())
+    return len(re.findall(r"^\s*[^\n:]{2,60}:", texto, flags=re.M)) >= 4 and ("NOMBRE" in t or "CLIENTE" in t)
+
+# ----------------------------------------------------------------------------
+# COTIZACIONES
+# ----------------------------------------------------------------------------
+estado = {}   # num -> {"menu": "cot"}
+espera = {}   # num -> {"fotos": [bytes], "ctx": dict|None, "t": epoch}
+MAX_FOTOS = 4
+VIGENCIA = 30 * 60  # segundos que se recuerdan fotos/cotización pendientes
+
+def _espera(num):
+    e = espera.get(num)
+    if e and time.time() - e["t"] > VIGENCIA:
+        e = None
+    if not e:
+        e = espera[num] = {"fotos": [], "ctx": None, "t": time.time()}
+    e["t"] = time.time()
+    return e
+
+def _linea_item(v):
+    """'2 / Llanta Pirelli 90/90-17 / S/ 185' -> (2, 'Llanta Pirelli 90/90-17', 185)."""
+    m = re.match(r"^\s*([\dxX.,]+)\s*/\s*(.+?)\s*/\s*(?:S/\.?\s*)?([\d.,]+)\s*$", v, re.S)
+    if not m:
+        return None
+    cant, desc, pu = a_monto(m.group(1).lower().replace("x", "")), m.group(2).strip(), a_monto(m.group(3))
+    if not cant or cant <= 0 or pu is None or not desc:
+        return None
+    return (cant, desc[0].upper() + desc[1:], pu)
+
+def _linea_inst(v):
+    m = re.match(r"^\s*(.+?)\s*/\s*(?:S/\.?\s*)?([\d.,]+)\s*$", v, re.S)
+    if not m:
+        return None
+    desc, monto = m.group(1).strip(), a_monto(m.group(2))
+    if monto is None or not desc:
+        return None
+    return (desc[0].upper() + desc[1:], monto)
+
+def revisar_cotizacion(texto):
+    d, _ = parsear(texto)
+    t = sin_acentos(d.get("tipo_venta", "").upper())
+    modo = "moto_acc" if ("MOTO" in t and "ACCESORIOS" in t) else ("acc" if "ACCESORIOS" in t else "moto")
+    faltan, avisos = [], []
+    if not d.get("cliente"):
+        faltan.append("CLIENTE")
+    doc = re.sub(r"\D", "", d.get("doc_cliente", ""))
+    if d.get("doc_cliente") and len(doc) not in (8, 9, 11):
+        avisos.append(f"DNI / RUC '{d['doc_cliente']}' no parece válido (8 dígitos DNI, 11 RUC)")
+    precio = None
+    if modo in ("moto", "moto_acc"):
+        for k, et in (("marca", "MARCA"), ("modelo", "MODELO")):
+            if not d.get(k):
+                faltan.append(et)
+        precio = a_monto(d["precio"]) if d.get("precio") else None
+        if precio is None:
+            faltan.append("PRECIO" + (f" ilegible: '{d['precio']}'" if d.get("precio") else ""))
+    items, insts = [], []
+    if modo in ("moto_acc", "acc"):
+        if not d.get("_acc"):
+            faltan.append("ACC 1 (cantidad / descripción / precio unitario)")
+        for i, v in enumerate(d.get("_acc", []), 1):
+            it = _linea_item(v)
+            if it: items.append(it)
+            else: faltan.append(f"ACC {i} ilegible: '{v}'. Formato: 2 / Exploradoras / 160")
+        for i, v in enumerate(d.get("_inst", []), 1):
+            it = _linea_inst(v)
+            if it: insts.append(it)
+            else: faltan.append(f"INSTALACIÓN {i} ilegible: '{v}'. Formato: Instalación de exploradoras / 120")
+    pct = 0.0
+    if d.get("descuento"):
+        pct = a_monto(d["descuento"].replace("%", "")) or 0.0
+        if not 0 <= pct <= 100:
+            avisos.append("El descuento debe estar entre 0 y 100"); pct = 0.0
+    if d.get("fecha") and not D.parsear_fecha(d["fecha"]):
+        avisos.append(f"FECHA '{d['fecha']}' no se entiende; usaré la de hoy. Formato: 19/11/2026")
+    if d.get("bono") and a_monto(d["bono"]) is None and len(d["bono"]) > 30:
+        avisos.append("El BONO es muy largo; escribe solo el monto, por ejemplo 500")
+
+    ctx = {"modo": modo, "d": d, "precio": precio, "items": items, "instalaciones": insts, "pct": pct, "fotos": []}
+    nombres = {"moto": "Cotización de moto", "moto_acc": "Cotización de moto + accesorios", "acc": "Cotización de accesorios"}
+    out = [f"🧾 *{nombres[modo]}*", ""]
+    out.append(f"*Cliente:* {d.get('cliente') or '—'}" + (f" ({d['doc_cliente']})" if d.get("doc_cliente") else ""))
+    if modo != "acc":
+        out.append(f"*Moto:* {' '.join(x for x in [d.get('marca'), d.get('modelo'), d.get('color')] if x) or '—'}")
+        if precio is not None:
+            out.append(f"*Precio de la moto:* {COT.money(precio)}")
+    if items:
+        sub, desc, neto, inst, total = COT.totales(ctx)
+        out.append(f"*Accesorios:* {len(items)} ítem(s) = {COT.money(sub)}")
+        if pct:
+            out.append(f"*Descuento {pct:g}%:* − {COT.money(desc)}  → {COT.money(neto)}")
+        if inst:
+            out.append(f"*Instalación:* {COT.money(inst)}")
+        out.append(f"*TOTAL:* {COT.money(total)}")
+    if faltan:
+        out += ["", "❌ *FALTA COMPLETAR:*"] + [f"• {x}" for x in faltan]
+        out.append("\nCorrige la plantilla y envíala de nuevo.")
+    elif avisos:
+        out += ["", "⚠️ *REVISA:*"] + [f"• {x}" for x in avisos]
+    return {"texto": "\n".join(out), "ctx": ctx, "faltan": faltan}
+
+def descargar_media(media_id):
+    h = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    r = requests.get(f"{GRAPH}/{media_id}", headers=h, timeout=15)
+    url = r.json().get("url")
+    if not url:
+        raise RuntimeError("Meta no devolvió la URL de la imagen: " + r.text[:150])
+    r2 = requests.get(url, headers=h, timeout=30)
+    r2.raise_for_status()
+    return r2.content
+
+def generar_cotizacion(num):
+    e = espera.get(num)
+    if not e or not e.get("ctx"):
+        enviar(num, "No tengo ninguna cotización pendiente. Escribe *5* para empezar una.")
+        return
+    ctx = e["ctx"]
+    ctx["fotos"] = e["fotos"][:MAX_FOTOS]
+    try:
+        pdf = COT.cotizacion_pdf(ctx)
+        d = ctx["d"]
+        base = d.get("cliente", "cliente") + "_" + (d.get("modelo") or "accesorios")
+        nombre = re.sub(r"[^A-Za-z0-9]+", "_", sin_acentos(base)).strip("_")[:50]
+        enviar_pdf(num, pdf, f"Cotizacion_{nombre}.pdf", "Cotización")
+        enviar(num, "✅ Cotización lista. Revísala antes de enviarla al cliente.")
+    except Exception as ex:
+        print("error cotizacion:", repr(ex))
+        enviar(num, "⚠️ No pude generar la cotización por un error interno. Avísale a Nick para revisar los logs.")
+    espera.pop(num, None)
+
+def atender_imagen(num, m):
+    try:
+        datos = COT.preparar_foto(descargar_media(m["image"]["id"]))
+    except Exception as ex:
+        print("error imagen:", repr(ex))
+        enviar(num, "⚠️ No pude leer esa foto. Intenta enviarla de nuevo (como foto, no como documento).")
+        return
+    e = _espera(num)
+    if len(e["fotos"]) < MAX_FOTOS:
+        e["fotos"].append(datos)
+    n = len(e["fotos"])
+    if e["ctx"]:
+        if e["ctx"]["modo"] == "moto" or n >= MAX_FOTOS:   # la cotización de moto usa una sola foto principal
+            generar_cotizacion(num)
+        else:
+            enviar(num, f"📷 Foto {n} recibida. Envía otra (máx. {MAX_FOTOS}) o escribe *LISTO* para generar la cotización.")
+    else:
+        enviar(num, f"📷 Foto {n} guardada. Ahora escribe *5*, elige el tipo de cotización y envía los datos; la pondré en el PDF.")
 
 def atender(num, texto):
     t = sin_acentos(texto.strip().upper())
     if parece_plantilla(texto):
+        d0, _ = parsear(texto)
+        if "COTIZ" in sin_acentos(d0.get("tipo_venta", "").upper()):
+            r = revisar_cotizacion(texto)
+            enviar(num, r["texto"])
+            if r["faltan"]:
+                return
+            e = _espera(num)
+            e["ctx"] = r["ctx"]
+            if e["fotos"]:
+                generar_cotizacion(num)
+            else:
+                enviar(num, "📷 ¿Quieres agregar foto? Envíala ahora (la moto o los accesorios). "
+                            "Si no, escribe *LISTO* y la genero sin foto.")
+            return
         r = revisar(texto)
         enviar(num, r["texto"])
         if r["faltan"]:
@@ -426,6 +646,16 @@ def atender(num, texto):
                 enviar(num, f"⚠️ No pude generar *{etiqueta}* por un error interno. Avísale a Nick para revisar los logs.")
         if enviados:
             enviar(num, f"✅ Listo: {enviados} documento(s) enviados. Revísalos antes de usarlos (modo prueba).")
+    elif t in ("LISTO", "SIN FOTO", "NO", "GENERAR") and espera.get(num, {}).get("ctx"):
+        generar_cotizacion(num)
+    elif estado.get(num, {}).get("menu") == "cot" and t in PLANTILLAS_COT:
+        estado.pop(num, None)
+        enviar(num, "Perfecto. Copia el siguiente mensaje, complétalo y envíamelo 👇\n"
+                    "(Los campos opcionales puedes borrarlos o dejarlos vacíos.)")
+        enviar(num, PLANTILLAS_COT[t])
+    elif t in ("5", "COTIZACION", "COTIZAR"):
+        estado[num] = {"menu": "cot"}
+        enviar(num, MENU_COT)
     elif t in PLANTILLAS or t in ("CONTADO", "SEPARACION"):
         clave = t if t in PLANTILLAS else {"CONTADO": "1", "SEPARACION": "2"}[t]
         enviar(num, "Perfecto. Copia el siguiente mensaje, complétalo y envíamelo 👇")
@@ -435,7 +665,7 @@ def atender(num, texto):
 
 @app.get("/")
 def home():
-    return "Bot Leo Motos activo ✅ (Prueba 3)"
+    return "Bot Leo Motos activo ✅ (Prueba 4)"
 
 @app.get("/webhook")
 def verificar():
@@ -460,8 +690,11 @@ def recibir():
                     if ALLOWED and num not in ALLOWED:
                         print("ignorado (no autorizado):", num)
                         continue
+                    if m.get("type") == "image":
+                        atender_imagen(num, m)
+                        continue
                     if m.get("type") != "text":
-                        enviar(num, "Por ahora solo leo mensajes de texto 🙂")
+                        enviar(num, "Por ahora solo leo texto y fotos 🙂")
                         continue
                     atender(num, m["text"]["body"])
     except Exception as e:
