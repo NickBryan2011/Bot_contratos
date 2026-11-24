@@ -51,6 +51,17 @@ try:
 except Exception:
     pass
 
+FUENTES_OK = (F_TIT == "BarlowCondensed-Bold" and F_REG == "Inter")
+_ESC_TIT = 1.0 if F_TIT == "BarlowCondensed-Bold" else 0.80   # Helvetica es mucho más ancha que Barlow Condensed
+
+
+def _tam(fuente, tam):
+    return tam * _ESC_TIT if fuente == F_TIT else tam
+
+
+def sw(s, fuente, tam):
+    return stringWidth(s, fuente, _tam(fuente, tam))
+
 
 def fecha_larga(dt=None):
     dt = dt or datetime.now(timezone(timedelta(hours=-5)))
@@ -123,14 +134,14 @@ class Hoja:
 
     def texto(self, x, y, s, fuente, tam, color=C_DARK, tr=0.0, alinear="l"):
         s = str(s)
-        ancho = stringWidth(s, fuente, tam) + tr * len(s)
+        ancho = sw(s, fuente, tam) + tr * len(s)
         if alinear == "r":
             x = x - ancho
         elif alinear == "c":
             x = x - ancho / 2
         t = self.c.beginText()
         t.setTextOrigin(x, self.Y(y))
-        t.setFont(fuente, tam)
+        t.setFont(fuente, _tam(fuente, tam))
         t.setFillColor(color)
         t.setCharSpace(tr)
         t.textOut(s)
@@ -139,7 +150,7 @@ class Hoja:
 
     def ajustar(self, s, fuente, tam_max, ancho_max, tam_min=12):
         tam = tam_max
-        while tam > tam_min and stringWidth(s, fuente, tam) > ancho_max:
+        while tam > tam_min and sw(s, fuente, tam) > ancho_max:
             tam -= 1
         return tam
 
@@ -155,7 +166,7 @@ class Hoja:
         palabras, lineas, act = s.split(), [], ""
         for p in palabras:
             prueba = (act + " " + p).strip()
-            if stringWidth(prueba, fuente, tam) <= ancho:
+            if sw(prueba, fuente, tam) <= ancho:
                 act = prueba
             else:
                 if act: lineas.append(act)
@@ -221,12 +232,13 @@ class Hoja:
         self.texto(W - MX - 16, self.y + 27, (texto_precio or "PRECIO").upper(), F_SEMI, 7, C_GRAY, tr=1.6, alinear="r")
         self.texto(W - MX - 16, self.y + 62, money(precio), F_TIT, 36, alinear="r")
         if etiqueta:
-            self._etiqueta(MX + 16 + stringWidth(modelo, F_TIT, t) + 10, self.y + 38, etiqueta)
+            ancho_sub = sw(sub, F_SEMI, 7) + 1.6 * len(sub)
+            self._etiqueta(MX + 16 + ancho_sub + 12, self.y + 11, etiqueta)
         self.y += h + 12
 
     def _etiqueta(self, x, y, txt, alinear="l"):
         txt = txt.upper()
-        w = stringWidth(txt, F_BOLD, 7.4) + 1.8 * len(txt) + 18
+        w = sw(txt, F_BOLD, 7.4) + 1.8 * len(txt) + 18
         if alinear == "r":
             x = x - w
         self.c.setFillColor(C_YEL)
@@ -237,6 +249,11 @@ class Hoja:
     def foto_card(self, fotos, alto):
         if not fotos:
             return
+        try:   # no más alta de lo que necesita la foto a todo el ancho
+            iw, ih = ImageReader(BytesIO(fotos[0])).getSize()
+            alto = min(alto, (CW / len(fotos) - 24) * ih / iw + 24)
+        except Exception:
+            pass
         self.caja(MX, self.y, CW, alto)
         n = len(fotos)
         ancho = CW / n
@@ -281,17 +298,20 @@ class Hoja:
         colw = (CW - 24) / 2
         izq = self._items(regalos, colw)
         der = self._items(incluye, colw)
-        alto = 58 + max(sum(h for _, h in izq), sum(h for _, h in der))
+        cab = 58 if (bono and izq) else 34
+        alto = cab + max(sum(h for _, h in izq), sum(h for _, h in der))
         self.necesita(alto + 10)
-        for x, titulo, items, con_bono in [(MX, "ACCESORIOS DE REGALO", izq, True),
-                                          (MX + colw + 24, "INCLUYE", der, False)]:
+        columnas = [(MX, "ACCESORIOS DE REGALO", izq, True), (MX + colw + 24, "INCLUYE", der, False)]
+        if not izq:
+            columnas = [(MX, "INCLUYE", der, False)]
+        for x, titulo, items, con_bono in columnas:
             if not items:
                 continue
             self.texto(x, self.y + 19, titulo, F_TIT, 19)
             if con_bono and bono:
                 self._etiqueta(x, self.y + 27, bono)
-            self.linea(x, x + colw, self.y + 54, C_DARK, 1.3)
-            yy = self.y + 54
+            self.linea(x, x + colw, self.y + cab - 4, C_DARK, 1.3)
+            yy = self.y + cab - 4
             for html, h in items:
                 self.texto(x + 2, yy + 17, "+", F_BOLD, 10.5)
                 self.parrafo(html, x + 20, yy + 5, colw - 20, F_REG, 10.4, 13)
@@ -337,7 +357,7 @@ class Hoja:
         self.texto(MX, self.y + 20, "ACCESORIOS", F_TIT, 24)
         if pct:
             txt = f"{pct:g}% DE DESCUENTO EN ACCESORIOS"
-            w = stringWidth(txt, F_BOLD, 7.4) + 1.8 * len(txt) + 30
+            w = sw(txt, F_BOLD, 7.4) + 1.8 * len(txt) + 30
             self.caja(W - MX - w, self.y + 3, w, 22, fill=C_DARK, borde=None)
             self.texto(W - MX - w + 15, self.y + 18, txt, F_BOLD, 7.4, C_YEL, tr=1.8)
         self.y += 40
@@ -379,7 +399,7 @@ class Hoja:
             for d, m in instalaciones:
                 self.necesita(30)
                 self.texto(MX, self.y + 17, d, F_REG, 10.5)
-                w = stringWidth(d, F_REG, 10.5)
+                w = sw(d, F_REG, 10.5)
                 self.texto(MX + w + 5, self.y + 17, "· sin descuento", F_REG, 8.2, C_GRAY)
                 self.texto(W - MX, self.y + 17, money(m), F_REG, 10.5, alinear="r")
                 self.y += 22
@@ -480,6 +500,7 @@ def cotizacion_pdf(c):
     h.encabezado(fecha_larga(dt))
     h.tarjetas_cliente(d.get("cliente", ""), d.get("doc_cliente", ""), vend)
     modelo = d.get("modelo", "")
+    modelo = modelo[:1].upper() + modelo[1:]
 
     if modo == "moto":
         h.moto_A(d.get("marca", ""), d.get("color", ""), modelo, d.get("etiqueta", ""), d.get("texto_precio", ""), c["precio"])
@@ -491,7 +512,7 @@ def cotizacion_pdf(c):
             bono = f"BONO DE S/ {b}" if b.replace(",", "").replace(".", "").isdigit() else b
         # alto disponible para la foto
         colw = (CW - 24) / 2
-        alto_l = 58 + max(sum(hh for _, hh in h._items(regalos, colw)) if regalos else 0,
+        alto_l = (58 if (bono and regalos) else 34) + max(sum(hh for _, hh in h._items(regalos, colw)) if regalos else 0,
                           sum(hh for _, hh in h._items(incluye, colw)) if incluye else 0)
         resto = (alto_l + 4 if (regalos or incluye) else 0) + 74 + 58
         alto_foto = max(120, min(230, H - 44 - h.y - resto - 12))

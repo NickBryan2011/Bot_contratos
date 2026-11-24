@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Generadores de PDF de Leo Motos Perú (réplica de los formatos Word)."""
+import os
 import re
 import unicodedata
 from io import BytesIO
@@ -14,6 +15,29 @@ from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame, Paragraph,
                                 Spacer, Table, TableStyle, KeepTogether)
 from reportlab.platypus.flowables import Flowable
 from reportlab.pdfgen import canvas as _canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+_FDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+_HELV = ("Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique")
+
+def _registrar(familia):
+    """Registra Regular/Bold/Italic/BoldItalic de fonts/<familia>-*.ttf. Si falta algo, usa Helvetica."""
+    try:
+        sufijos = ["Regular", "Bold", "Italic", "BoldItalic"]
+        nombres = [f"{familia}" if s == "Regular" else f"{familia}-{s}" for s in sufijos]
+        for nom, suf in zip(nombres, sufijos):
+            pdfmetrics.registerFont(TTFont(nom, os.path.join(_FDIR, f"{familia}-{suf}.ttf")))
+        pdfmetrics.registerFontFamily(nombres[0], normal=nombres[0], bold=nombres[1],
+                                      italic=nombres[2], boldItalic=nombres[3])
+        return tuple(nombres)
+    except Exception as e:
+        print("Fuente no disponible, uso Helvetica:", familia, repr(e))
+        return _HELV
+
+NARROW = _registrar("LiberationSansNarrow")   # = Arial Narrow (texto de los contratos)
+CALIBRI = _registrar("Carlito")               # = Calibri (títulos y encabezados azules)
+CAMBRIA = _registrar("Caladea")               # = Cambria (checklist y título de la garantía)
 
 # ----------------------------------------------------------------------------
 # UTILIDADES
@@ -102,37 +126,42 @@ AZUL = colors.HexColor("#4F81BD")
 AZUL_OSC = colors.HexColor("#366091")
 GRIS = colors.HexColor("#7F8FA6")
 VERDE = colors.HexColor("#3B9B50")
-F, FB, FI, FBI = "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique"
+F, FB, FI, FBI = NARROW
+FUENTES_OK = (NARROW[0] == "LiberationSansNarrow" and CALIBRI[0] == "Carlito" and CAMBRIA[0] == "Caladea")
+CF, CFB = CALIBRI[0], CALIBRI[1]
 
-def _estilos(cuerpo=10):
-    base = dict(fontName=F, fontSize=cuerpo, leading=cuerpo * 1.3, spaceAfter=7, alignment=TA_LEFT)
+def _estilos(cuerpo=12, fam=None):
+    fam = fam or NARROW
+    R, B, I, BI = fam
+    lead = cuerpo * 1.22
+    base = dict(fontName=R, fontSize=cuerpo, leading=lead, spaceAfter=9, alignment=TA_LEFT)
     S = {
-        "marca": ParagraphStyle("marca", fontName=FB, fontSize=12.5, leading=15, textColor=AZUL,
+        "marca": ParagraphStyle("marca", fontName=CFB, fontSize=13, leading=16, textColor=AZUL,
                                 alignment=TA_CENTER, spaceAfter=2),
-        "titulo": ParagraphStyle("titulo", fontName=FB, fontSize=11, leading=14,
-                                 alignment=TA_CENTER, spaceAfter=6),
-        "tituloazul": ParagraphStyle("tituloazul", fontName=FB, fontSize=11, leading=14, textColor=AZUL,
+        "titulo": ParagraphStyle("titulo", fontName=B, fontSize=13, leading=16,
+                                 alignment=TA_CENTER, spaceAfter=8),
+        "tituloazul": ParagraphStyle("tituloazul", fontName=CFB, fontSize=12, leading=15, textColor=AZUL,
                                      alignment=TA_CENTER, spaceAfter=3),
-        "titulo_sep": ParagraphStyle("titulo_sep", fontName=F, fontSize=10.5, leading=14,
-                                     alignment=TA_CENTER, spaceAfter=14),
-        "h": ParagraphStyle("h", fontName=FB, fontSize=11.5, leading=14, textColor=AZUL,
-                            spaceBefore=9, spaceAfter=3, keepWithNext=1),
-        "hs": ParagraphStyle("hs", fontName=F, fontSize=cuerpo, leading=cuerpo * 1.3,
-                             spaceBefore=8, spaceAfter=3, keepWithNext=1),
+        "titulo_sep": ParagraphStyle("titulo_sep", fontName=R, fontSize=cuerpo, leading=lead,
+                                     alignment=TA_CENTER, spaceAfter=16),
+        "h": ParagraphStyle("h", fontName=CFB, fontSize=13, leading=16, textColor=AZUL,
+                            spaceBefore=11, spaceAfter=4, keepWithNext=1),
+        "hs": ParagraphStyle("hs", fontName=R, fontSize=cuerpo, leading=lead,
+                             spaceBefore=9, spaceAfter=3, keepWithNext=1),
         "p": ParagraphStyle("p", **base),
         "pc": ParagraphStyle("pc", **{**base, "spaceAfter": 0}),
-        "campo": ParagraphStyle("campo", **{**base, "spaceAfter": 4, "leading": cuerpo * 1.25}),
+        "campo": ParagraphStyle("campo", **{**base, "spaceAfter": 3}),
         "j": ParagraphStyle("j", **{**base, "alignment": TA_JUSTIFY}),
-        "b": ParagraphStyle("b", **{**base, "fontName": FB, "alignment": TA_JUSTIFY}),
-        "ib": ParagraphStyle("ib", **{**base, "fontName": FBI, "alignment": TA_JUSTIFY}),
-        "bullet": ParagraphStyle("bullet", **{**base, "fontName": FB, "spaceAfter": 1,
+        "b": ParagraphStyle("b", **{**base, "fontName": B, "alignment": TA_JUSTIFY}),
+        "ib": ParagraphStyle("ib", **{**base, "fontName": BI, "alignment": TA_JUSTIFY}),
+        "bullet": ParagraphStyle("bullet", **{**base, "fontName": B, "spaceAfter": 1,
                                               "leftIndent": 36, "bulletIndent": 18}),
         "bulletn": ParagraphStyle("bulletn", **{**base, "spaceAfter": 2, "leftIndent": 36, "bulletIndent": 18}),
-        "obs": ParagraphStyle("obs", fontName=FB, fontSize=10, leading=13, textColor=AZUL,
+        "obs": ParagraphStyle("obs", fontName=CFB, fontSize=cuerpo, leading=lead, textColor=AZUL,
                               spaceBefore=8, spaceAfter=2),
-        "celda": ParagraphStyle("celda", fontName=F, fontSize=9.5, leading=12),
-        "celda_b": ParagraphStyle("celda_b", fontName=FB, fontSize=9.5, leading=12),
-        "linea": ParagraphStyle("linea", **{**base, "spaceAfter": 2, "leading": cuerpo * 1.2}),
+        "celda": ParagraphStyle("celda", fontName=R, fontSize=cuerpo - 0.5, leading=(cuerpo - 0.5) * 1.2),
+        "celda_b": ParagraphStyle("celda_b", fontName=B, fontSize=cuerpo - 0.5, leading=(cuerpo - 0.5) * 1.2),
+        "linea": ParagraphStyle("linea", **{**base, "spaceAfter": 2, "leading": cuerpo * 1.18}),
     }
     return S
 
@@ -153,14 +182,14 @@ class _NumCanvas(_canvas.Canvas):
             self.__dict__.update(est)
             n = self._pageNumber
             if self.pie == "leo":
-                self.setFont(F, 9)
+                self.setFont(CF, 10)
                 self.drawString(90, 38, "Leo Motos Perú | RUC 20606384212 | Av. Tomás Valle 1641 – SMP")
                 self.drawRightString(522, 38, f"{n} de {total}")
             elif self.pie == "num":
-                self.setFont(F, 9)
+                self.setFont(CF, 10)
                 self.drawRightString(522, 38, f"{n} de {total}")
             elif self.pie == "sep":
-                self.setFont(F, 9)
+                self.setFont(CF, 10)
                 self.setFillColor(GRIS)
                 self.drawRightString(612 - 85, 38, f"Condiciones de separación de vehículo  Página {n} | {total}")
             super().showPage()
@@ -346,8 +375,10 @@ def contrato_pdf(c):
 # ----------------------------------------------------------------------------
 def garantia_pdf(c):
     S = _estilos()
-    el = [Paragraph("LEO MOTOS PERÚ", S["marca"]),
-          Paragraph("CERTIFICADO DE GARANTIA", S["titulo"])]
+    el = [Paragraph("LEO MOTOS PERÚ", ParagraphStyle("gm", fontName=CAMBRIA[1], fontSize=16, leading=19,
+                    textColor=AZUL_OSC, alignment=TA_CENTER, spaceAfter=2)),
+          Paragraph("CERTIFICADO DE GARANTIA", ParagraphStyle("gt", fontName=CAMBRIA[1], fontSize=12, leading=15,
+                    alignment=TA_CENTER, spaceAfter=8))]
     el += _bloque_partes(S, c)
     el.append(Paragraph("4. ALCANCE DE LA GARANTÍA", S["h"]))
     el.append(Paragraph("La garantía comercial es otorgada exclusivamente por el fabricante o la marca de la "
@@ -383,11 +414,11 @@ def garantia_pdf(c):
 # 3) CHECKLIST DE REVISIÓN (004)
 # ----------------------------------------------------------------------------
 def checklist_pdf(c):
-    S = _estilos(9.5)
+    S = _estilos(11, CAMBRIA)
     d = c["d"]
     fecha = d.get("fecha_entrega") or hoy_lima().strftime("%d/%m/%Y")
     el = [Spacer(1, 18), Paragraph("CHECKLIST DE REVISIÓN DEL VEHÍCULO",
-          ParagraphStyle("t", fontName=FB, fontSize=11, textColor=AZUL_OSC, alignment=TA_CENTER, spaceAfter=24))]
+          ParagraphStyle("t", fontName=CFB, fontSize=12, textColor=AZUL_OSC, alignment=TA_CENTER, spaceAfter=24))]
     P = lambda t: Paragraph(t, S["celda"])
     datos = Table([[P(f"Cliente: {_x(d.get('nombre'))}"), P(f"DNI: {_x(d.get('num_doc'))}")],
                    [P(f"Marca: {_x(d.get('marca'))}"), P(f"Color: {_x(d.get('color'))}")],
@@ -430,7 +461,7 @@ def acta_pdf(c):
     d = c["d"]
     el = [Paragraph("LEO MOTOS PERU", S["tituloazul"]),
           Paragraph("ACTA DE ENTREGA DE MOTOCICLETA",
-                    ParagraphStyle("t2", fontName=FB, fontSize=11, textColor=AZUL, alignment=TA_CENTER, spaceAfter=8))]
+                    ParagraphStyle("t2", fontName=CFB, fontSize=12, textColor=AZUL, alignment=TA_CENTER, spaceAfter=8))]
     el += _bloque_partes(S, c)
     el.append(Paragraph("4. ACCESORIOS Y DOCUMENTOS ENTREGADOS", S["h"]))
     llaves = (d.get("llaves") or "").strip()
@@ -472,7 +503,7 @@ def _firma_vendedor_comprador(S):
     return [Spacer(1, 60), t]
 
 def separacion_piso_pdf(c):
-    S = _estilos(10.5)
+    S = _estilos(12)
     d = c["d"]
     monto = c["monto_sep"]
     dia, mes, anio = _fecha_larga(c)
@@ -533,7 +564,7 @@ def separacion_piso_pdf(c):
     return _construir(el, "sep", margenes=(85, 85, 70, 70), titulo="Separación de vehículo en piso")
 
 def separacion_pedido_pdf(c):
-    S = _estilos(10.5)
+    S = _estilos(12)
     d = c["d"]
     monto = c["monto_sep"]
     dia, mes, anio = _fecha_larga(c)
@@ -566,7 +597,7 @@ def separacion_pedido_pdf(c):
     for t in ["Vehículos hasta S/ 7,000.00 → Tope máximo de retención: S/ 500.00",
               "Vehículos desde S/ 7,001.00 hasta S/ 15,000.00 → Tope máximo de retención: S/ 1000.00",
               "Vehículos mayores a S/ 15,000.00 → Tope máximo de retención: S/ 1500.00"]:
-        el.append(Paragraph(_x(t).replace("→", "-&gt;"), S["bulletn"], bulletText="•"))
+        el.append(Paragraph(_x(t), S["bulletn"], bulletText="•"))
     el += [Spacer(1, 4),
            Paragraph("Dicho monto será retenido como compensación razonable por los gastos administrativos, comerciales, "
                      "de adquisición, importación, logística e inmovilización del vehículo, conforme a la normativa vigente "
@@ -607,7 +638,7 @@ def separacion_pedido_pdf(c):
 # 7) CONTRATO PARA VENTAS CON GLOBAL GO (2_2)
 # ----------------------------------------------------------------------------
 def contrato_globalgo_pdf(c):
-    S = _estilos()
+    S = _estilos(11, CALIBRI)
     d, pagos, precio = c["d"], c["pagos"], c["precio"]
     tipo_txt = {"DNI": "DNI", "RUC": "RUC", "CE": "CE"}.get(c.get("tipo"), d.get("tipo_doc", ""))
     contacto = " / ".join(x for x in [d.get("celular"), d.get("direccion"), d.get("correo")] if x)
@@ -622,7 +653,7 @@ def contrato_globalgo_pdf(c):
 
     el = [Paragraph("CONTRATO DE COMPRAVENTA DE MOTOCICLETA NUEVA (0 KM)", S["tituloazul"]),
           Paragraph("LEO MOTOS PERU - VENTA FINANCIADA POR GLOBAL GO",
-                    ParagraphStyle("t3", fontName=F, fontSize=9.5, alignment=TA_CENTER, spaceAfter=10)),
+                    ParagraphStyle("t3", fontName=CF, fontSize=10, alignment=TA_CENTER, spaceAfter=10)),
           Paragraph("DATOS DE LAS PARTES", S["h"]),
           tabla([("Vendedor", "Leo Motos Perú Motorcycle Shop E.I.R.L."), ("RUC", "20606384212"),
                  ("Domicilio", "TOMAS VALLE 1641- SAN MARTIN DE PORRES"), ("Comprador", d.get("nombre", "")),

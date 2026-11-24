@@ -665,7 +665,8 @@ def atender(num, texto):
 
 @app.get("/")
 def home():
-    return "Bot Leo Motos activo ✅ (Prueba 4)"
+    ok = COT.FUENTES_OK and D.FUENTES_OK
+    return "Bot Leo Motos activo ✅ (Prueba 4) – Fuentes: " + ("OK ✅" if ok else "FALTAN ⚠️ (sube la carpeta fonts completa)")
 
 @app.get("/webhook")
 def verificar():
