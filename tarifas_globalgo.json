@@ -1,0 +1,19 @@
+{
+  "plazos": {
+    "12": {
+      "tem": 0.0581,
+      "gasto": 181.5
+    },
+    "18": {
+      "tem": 0.057882,
+      "gasto": 189.94
+    },
+    "24": {
+      "tem": 0.057796,
+      "gasto": 194.48
+    }
+  },
+  "soat": 832.0,
+  "soat_inicial_minima": 665.6,
+  "inicial_minima_pct": 20.0
+}

@@ -6,6 +6,7 @@ from flask import Flask, request, abort
 import time
 import documentos as D
 import cotizacion as COT
+import simulador as SIM
 from documentos import sin_acentos, numero_a_letras
 
 app = Flask(__name__)
@@ -28,7 +29,8 @@ MENU = (
     "2️⃣ Separación (venta al contado, pago parcial)\n"
     "3️⃣ Financiamiento – inicial (separación)\n"
     "4️⃣ Financiamiento – entrega final (recoge la moto)\n"
-    "5️⃣ Cotización (moto, moto + accesorios o accesorios)\n\n"
+    "5️⃣ Cotización (moto, moto + accesorios o accesorios)\n"
+    "6️⃣ Simular cuotas (Global Go)\n\n"
     "Responde con el número."
 )
 
@@ -141,6 +143,19 @@ MENU_COT = ("¿Qué vas a cotizar?\n\n1️⃣ Moto (con regalos y beneficios)\n2
             "3️⃣ Solo accesorios\n\nResponde con el número.")
 PLANTILLAS_COT = {"1": PLANTILLA_COT_MOTO, "2": PLANTILLA_COT_MOTO_ACC, "3": PLANTILLA_COT_ACC}
 
+PLANTILLA_SIMULACION = """TIPO: SIMULACIÓN DE CUOTAS
+FECHA (vacía = hoy):
+CLIENTE (opcional):
+MARCA (opcional):
+MODELO (opcional):
+COLOR (opcional):
+PRECIO DE LA MOTO:
+
+INICIALES (monto en soles o porcentaje, ej. 2000 o 25%)
+INICIAL 1:
+INICIAL 2 (opcional):
+INICIAL 3 (opcional):"""
+
 PLANTILLAS = {"1": PLANTILLA_CONTADO, "2": PLANTILLA_SEPARACION,
               "3": PLANTILLA_FIN_INICIAL, "4": PLANTILLA_FIN_FINAL}
 NOMBRES_FLUJO = {"contado": "Venta al contado", "separacion": "Separación (contado)",
@@ -185,8 +200,9 @@ CAMPOS = {
     "ETIQUETA": "etiqueta", "TEXTO DEL PRECIO": "texto_precio",
     "REGALOS": "regalos", "INCLUYE": "incluye", "TEXTO PRECIO FINAL": "texto_final",
     "DESCUENTO ACCESORIOS": "descuento", "DESCUENTO": "descuento",
+    "PRECIO DE LA MOTO": "precio",
 }
-ENCABEZADOS = {"COMPRADOR", "MOTO", "PRECIO", "PAGOS", "ENTREGA", "EXTRAS", "ACCESORIOS", "REGALOS Y BENEFICIOS"}
+ENCABEZADOS = {"COMPRADOR", "MOTO", "PRECIO", "PAGOS", "ENTREGA", "EXTRAS", "ACCESORIOS", "REGALOS Y BENEFICIOS", "INICIALES"}
 
 def parsear(texto):
     datos, pagos = {}, []
@@ -200,6 +216,11 @@ def parsear(texto):
             etiqueta, valor = l.split(":", 1)
             et = norm_label(etiqueta)
             valor = valor.strip()
+            if re.fullmatch(r"INICIAL\s*\d+", et):
+                if valor and not valor.upper().startswith("MONTO"):
+                    datos.setdefault("_ini", []).append(valor)
+                ultimo = None
+                continue
             if re.fullmatch(r"(ACC|ACCESORIO)\s*\d+", et):
                 if valor and not valor.upper().startswith("CANT"):
                     datos.setdefault("_acc", []).append(valor)
@@ -562,6 +583,54 @@ def revisar_cotizacion(texto):
         out += ["", "⚠️ *REVISA:*"] + [f"• {x}" for x in avisos]
     return {"texto": "\n".join(out), "ctx": ctx, "faltan": faltan}
 
+
+def revisar_simulacion(texto):
+    d, _ = parsear(texto)
+    faltan, avisos = [], []
+    precio = a_monto(d["precio"]) if d.get("precio") else None
+    if precio is None or precio <= 0:
+        faltan.append("PRECIO DE LA MOTO" + (f" ilegible: '{d['precio']}'" if d.get("precio") else ""))
+    if not d.get("_ini"):
+        faltan.append("INICIAL 1 (monto o porcentaje)")
+    sims = []
+    for i, v in enumerate(d.get("_ini", []), 1):
+        if "%" in v:
+            p = a_monto(v.replace("%", ""))
+            monto = round(precio * p / 100.0, 2) if (p is not None and precio) else None
+        else:
+            monto = a_monto(v)
+        if monto is None or monto < 0:
+            faltan.append(f"INICIAL {i} ilegible: '{v}'. Escribe un monto (2000) o un porcentaje (25%)")
+            continue
+        if precio and monto >= precio:
+            faltan.append(f"INICIAL {i} no puede ser igual o mayor al precio")
+            continue
+        if precio:
+            r = SIM.simular(precio, monto)
+            if r["aviso"]:
+                avisos.append(f"INICIAL {i}: {r['aviso']}")
+            sims.append((monto, r))
+    if d.get("fecha") and not D.parsear_fecha(d["fecha"]):
+        avisos.append(f"FECHA '{d['fecha']}' no se entiende; usaré la de hoy. Formato: 19/11/2026")
+    out = ["🧮 *Simulación de cuotas (Global Go)*", ""]
+    moto = " ".join(x for x in [d.get("marca"), d.get("modelo"), d.get("color")] if x)
+    if d.get("cliente"): out.append(f"*Cliente:* {d['cliente']}")
+    if moto: out.append(f"*Moto:* {moto}")
+    if precio: out.append(f"*Precio:* {COT.money(precio)}")
+    for monto, r in sims:
+        out.append("")
+        out.append(f"*Inicial {COT.money(monto)} ({r['inicial_pct']:.0f}%) · financia {COT.money(r['financiado'])}*")
+        for m, v in r["plazos"].items():
+            out.append(f"• {m} meses: S/ {v['sin_soat']:,.2f} sin SOAT | S/ {v['con_soat']:,.2f} con SOAT (semanal)")
+    if faltan:
+        out += ["", "❌ *FALTA COMPLETAR:*"] + [f"• {x}" for x in faltan]
+        out.append("\nCorrige la plantilla y envíala de nuevo.")
+    else:
+        if avisos:
+            out += ["", "⚠️ *REVISA:*"] + [f"• {x}" for x in avisos]
+        out += ["", "_Cuotas semanales referenciales; el valor final depende de la evaluación crediticia de Global Go._"]
+    return {"texto": "\n".join(out), "faltan": faltan, "d": d, "precio": precio, "sims": sims}
+
 def descargar_media(media_id):
     h = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     r = requests.get(f"{GRAPH}/{media_id}", headers=h, timeout=15)
@@ -614,6 +683,19 @@ def atender(num, texto):
     t = sin_acentos(texto.strip().upper())
     if parece_plantilla(texto):
         d0, _ = parsear(texto)
+        if "SIMULAC" in sin_acentos(d0.get("tipo_venta", "").upper()):
+            r = revisar_simulacion(texto)
+            enviar(num, r["texto"])
+            if not r["faltan"]:
+                try:
+                    pdf = COT.simulacion_pdf({"d": r["d"], "precio": r["precio"], "simulaciones": r["sims"]})
+                    base = r["d"].get("cliente") or r["d"].get("modelo") or "cliente"
+                    nombre = re.sub(r"[^A-Za-z0-9]+", "_", sin_acentos(base)).strip("_")[:40]
+                    enviar_pdf(num, pdf, f"Simulacion_cuotas_{nombre}.pdf", "Simulación de cuotas")
+                except Exception as ex:
+                    print("error simulacion:", repr(ex))
+                    enviar(num, "⚠️ No pude generar el PDF de la simulación. Avísale a Nick para revisar los logs.")
+            return
         if "COTIZ" in sin_acentos(d0.get("tipo_venta", "").upper()):
             r = revisar_cotizacion(texto)
             enviar(num, r["texto"])
@@ -653,6 +735,9 @@ def atender(num, texto):
         enviar(num, "Perfecto. Copia el siguiente mensaje, complétalo y envíamelo 👇\n"
                     "(Los campos opcionales puedes borrarlos o dejarlos vacíos.)")
         enviar(num, PLANTILLAS_COT[t])
+    elif t in ("6", "SIMULAR", "SIMULACION", "CUOTAS"):
+        enviar(num, "Perfecto. Copia el siguiente mensaje, complétalo y envíamelo 👇")
+        enviar(num, PLANTILLA_SIMULACION)
     elif t in ("5", "COTIZACION", "COTIZAR"):
         estado[num] = {"menu": "cot"}
         enviar(num, MENU_COT)
@@ -666,7 +751,7 @@ def atender(num, texto):
 @app.get("/")
 def home():
     ok = COT.FUENTES_OK and D.FUENTES_OK
-    return "Bot Leo Motos activo ✅ (Prueba 4) – Fuentes: " + ("OK ✅" if ok else "FALTAN ⚠️ (sube la carpeta fonts completa)")
+    return "Bot Leo Motos activo ✅ (Prueba 5) – Fuentes: " + ("OK ✅" if ok else "FALTAN ⚠️ (sube la carpeta fonts completa)")
 
 @app.get("/webhook")
 def verificar():

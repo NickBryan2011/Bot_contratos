@@ -185,10 +185,10 @@ class Hoja:
             print("foto no válida:", repr(e))
 
     # --- bloques ----------------------------------------------------------
-    def encabezado(self, fecha_txt):
+    def encabezado(self, fecha_txt, titulo="COTIZACIÓN"):
         self.texto(MX, 58, "LEO MOTOS PERÚ", F_TIT, 31)
         self.texto(MX, 72, "MOTORCYCLE SHOP E.I.R.L. · RUC 20606384212", F_MED, 7.6, C_GRAY, tr=1.7)
-        self.texto(W - MX, 57, "COTIZACIÓN", F_TIT, 26, alinear="r")
+        self.texto(W - MX, 57, titulo, F_TIT, 26, alinear="r")
         self.texto(W - MX, 71, fecha_txt, F_REG, 8.6, C_GRAY, alinear="r")
         self.linea(MX, W - MX, 86, C_DARK, 1.8)
         self.y = 107
@@ -431,6 +431,33 @@ class Hoja:
             self.texto(x2 + 16, self.y + 67, f"{vend['cargo']} · Leo Motos Perú", F_REG, 7.8, C_DARK)
         self.y += 72 + 14
 
+
+    # --- simulación de cuotas ---------------------------------------------
+    def bloque_inicial(self, inicial, pct, financiado, plazos):
+        alto = 50 + 18 + 3 * 22 + 2
+        self.necesita(alto + 8)
+        y0 = self.y
+        self.caja(MX, y0, CW, alto)
+        self.texto(MX + 16, y0 + 17, "CUOTA INICIAL", F_SEMI, 7, C_GRAY, tr=1.6)
+        self.texto(MX + 16, y0 + 42, money(inicial), F_TIT, 27)
+        self.texto(MX + 190, y0 + 17, "% DEL PRECIO", F_SEMI, 7, C_GRAY, tr=1.6)
+        self.texto(MX + 190, y0 + 42, f"{pct:.1f}%", F_TIT, 20)
+        self.texto(W - MX - 16, y0 + 17, "MONTO FINANCIADO", F_SEMI, 7, C_GRAY, tr=1.6, alinear="r")
+        self.texto(W - MX - 16, y0 + 42, money(financiado), F_TIT, 27, alinear="r")
+        yy = y0 + 50
+        self.caja(MX + 16, yy, CW - 32, 18, fill=C_DARK, borde=None)
+        self.texto(MX + 28, yy + 12.5, "PLAZO · CUOTA SEMANAL", F_BOLD, 6.8, C_YEL, tr=1.5)
+        self.texto(MX + 250, yy + 12.5, "SOAT INCLUIDO", F_BOLD, 6.8, C_YEL, tr=1.5, alinear="r")
+        self.texto(W - MX - 28, yy + 12.5, "SOAT NO INCLUIDO", F_BOLD, 6.8, C_YEL, tr=1.5, alinear="r")
+        yy += 18
+        for m, v in plazos.items():
+            self.texto(MX + 28, yy + 16, f"{m} meses", F_TIT, 14)
+            self.texto(MX + 250, yy + 15.5, f"S/ {v['con_soat']:,.2f}", F_SEMI, 10.5, alinear="r")
+            self.texto(W - MX - 28, yy + 15.5, f"S/ {v['sin_soat']:,.2f}", F_SEMI, 10.5, alinear="r")
+            yy += 22
+            self.linea(MX + 16, W - MX - 16, yy, C_LINE, 0.7)
+        self.y += alto + 6
+
     def galeria(self, fotos):
         if not fotos:
             return
@@ -552,3 +579,38 @@ def totales(c):
     inst = round(sum(m for _, m in c.get("instalaciones", [])), 2)
     total = round((c["precio"] if c["modo"] in ("moto_acc", "moto") and c.get("precio") else 0) + (neto if c["modo"] != "moto" else 0) + inst, 2)
     return sub, desc, neto, inst, total
+
+
+def simulacion_pdf(c):
+    """c: d (cliente, marca, modelo, color, fecha...), precio, simulaciones: [(inicial, resultado)]"""
+    d = c["d"]
+    vend = _vend(d)
+    dt = None
+    try:
+        from documentos import parsear_fecha
+        dt = parsear_fecha(d.get("fecha", ""))
+    except Exception:
+        pass
+    h = Hoja()
+    h.c.setTitle("Simulación de cuotas - Leo Motos Perú")
+    h.encabezado(fecha_larga(dt), "SIMULACIÓN")
+    h.tarjetas_cliente(d.get("cliente", "") or "—", d.get("doc_cliente", ""), vend)
+    modelo = (d.get("modelo", "") or "")
+    modelo = modelo[:1].upper() + modelo[1:]
+    if d.get("marca") or modelo:
+        h.moto_A(d.get("marca", ""), d.get("color", ""), modelo or d.get("marca", ""), "", "PRECIO DE LA MOTO", c["precio"])
+    else:
+        h.caja(MX, h.y, CW, 54)
+        h.texto(MX + 16, h.y + 22, "PRECIO DE LA MOTO", F_SEMI, 7, C_GRAY, tr=1.6)
+        h.texto(MX + 16, h.y + 46, money(c["precio"]), F_TIT, 28)
+        h.y += 54 + 12
+    for inicial, r in c["simulaciones"]:
+        h.bloque_inicial(inicial, r["inicial_pct"], r["financiado"], r["plazos"])
+    h.necesita(60)
+    nota = ("Cuotas semanales referenciales. El valor final de las cuotas depende de la evaluación crediticia de Global Go.")
+    for ln in h.dividir(nota, F_REG, 8.6, CW):
+        h.texto(MX, h.y + 10, ln, F_REG, 8.6, C_GRAY)
+        h.y += 12
+    h.y += 8
+    h.contacto_banda(vend)
+    return h.cerrar()
