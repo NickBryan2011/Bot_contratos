@@ -4,6 +4,7 @@ import requests
 from flask import Flask, request, abort
 
 import time
+import json
 import documentos as D
 import cotizacion as COT
 import simulador as SIM
@@ -20,6 +21,12 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 ALLOWED = {n.strip() for n in os.environ.get("ALLOWED_NUMBERS", "").split(",") if n.strip()}
 GRAPH = "https://graph.facebook.com/v21.0"
 
+# IA gratuita (Groq): notas de voz -> texto, y texto libre -> plantilla prellenada
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+GROQ_LLM_MODEL = os.environ.get("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
+GROQ_URL = "https://api.groq.com/openai/v1"
+
 # ----------------------------------------------------------------------------
 # MENÚ Y PLANTILLAS
 # ----------------------------------------------------------------------------
@@ -31,7 +38,8 @@ MENU = (
     "4️⃣ Financiamiento – entrega final (recoge la moto)\n"
     "5️⃣ Cotización (moto, moto + accesorios o accesorios)\n"
     "6️⃣ Simular cuotas (Global Go)\n\n"
-    "Responde con el número."
+    "Responde con el número. También puedes enviarme una *nota de voz* o un mensaje contándome la venta "
+    "y yo preparo la plantilla."
 )
 
 _COMPRADOR = """COMPRADOR
@@ -631,6 +639,170 @@ def revisar_simulacion(texto):
         out += ["", "_Cuotas semanales referenciales; el valor final depende de la evaluación crediticia de Global Go._"]
     return {"texto": "\n".join(out), "faltan": faltan, "d": d, "precio": precio, "sims": sims}
 
+
+# ----------------------------------------------------------------------------
+# VOZ Y TEXTO LIBRE (IA de Groq): la IA solo EXTRAE datos; nunca decide ni emite nada
+# ----------------------------------------------------------------------------
+VOCABULARIO = ("Venta de motos en Perú. Suzuki, Haojue, CF Moto, Senke, Gixxer, V-Strom, Yamaha, Honda. "
+               "DNI, RUC, chasis, motor, placa, Yape, Plin, transferencia, tarjeta BCP, BBVA, Interbank, "
+               "Global Go, SOAT, separación, a pedido, cotización, inicial, cuota, accesorios, casco.")
+
+TIPOS_IA = {
+    "contado": PLANTILLA_CONTADO, "separacion": PLANTILLA_SEPARACION,
+    "financiamiento_inicial": PLANTILLA_FIN_INICIAL, "financiamiento_final": PLANTILLA_FIN_FINAL,
+    "cotizacion_moto": PLANTILLA_COT_MOTO, "cotizacion_moto_accesorios": PLANTILLA_COT_MOTO_ACC,
+    "cotizacion_accesorios": PLANTILLA_COT_ACC, "simulacion": PLANTILLA_SIMULACION,
+}
+
+PROMPT_EXTRACCION = """Eres un asistente que EXTRAE datos de una venta de motos en Perú a partir de un texto o audio transcrito.
+Responde SOLO con un objeto JSON válido. Reglas:
+- NO inventes nada. Si un dato no se menciona, usa null.
+- Montos como número sin símbolo (5460 o 5460.50). Fechas dd/mm/aaaa. Hoy es __HOY__.
+- Textos en MAYÚSCULAS para nombres, marca, modelo, color, chasis y motor (chasis y motor sin espacios).
+- "tipo" debe ser uno de: contado, separacion, financiamiento_inicial, financiamiento_final, cotizacion_moto, cotizacion_moto_accesorios, cotizacion_accesorios, simulacion, desconocido.
+  (contado = venta y entrega; separacion = el cliente deja un adelanto; financiamiento = crédito Global Go; cotizacion = solo precio/proforma; simulacion = calcular cuotas)
+- tipo_doc: DNI, RUC o CE. recoge: COMPRADOR o TERCERO. en_piso: SÍ o NO.
+- medio de cada pago: YAPE, PLIN, TRANSFERENCIA (+banco), TARJETA (+banco) o EFECTIVO.
+Campos posibles: vendedor, responsable, nombre, cliente, tipo_doc, num_doc, doc_cliente, estado_civil, celular, correo, direccion,
+marca, modelo, anio, color, chasis, motor, precio, en_piso, plazo, recoge, tercero_nombre, tercero_dni, fecha_entrega, llaves, km,
+regalias, regalos, bono, incluye, observaciones, descuento,
+pagos: [{"fecha":"", "monto":0, "medio":"", "op":""}], accesorios: [{"cant":1, "desc":"", "pu":0}],
+instalaciones: [{"desc":"", "monto":0}], iniciales: ["2000" o "25%"].
+Formato de salida: {"tipo": "...", ...campos}"""
+
+def _groq(path, **kw):
+    kw.setdefault("timeout", 40)
+    kw.setdefault("headers", {})["Authorization"] = f"Bearer {GROQ_API_KEY}"
+    return requests.post(f"{GROQ_URL}{path}", **kw)
+
+def transcribir(audio):
+    r = _groq("/audio/transcriptions",
+              files={"file": ("nota.ogg", audio, "audio/ogg")},
+              data={"model": GROQ_STT_MODEL, "language": "es", "response_format": "json",
+                    "temperature": "0", "prompt": VOCABULARIO})
+    if r.status_code != 200:
+        raise RuntimeError(f"Groq STT {r.status_code}: {r.text[:150]}")
+    return (r.json().get("text") or "").strip()
+
+MODELOS_LLM = [m for i, m in enumerate([GROQ_LLM_MODEL, "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"])
+               if m and m not in [GROQ_LLM_MODEL, "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"][:i]]
+
+def extraer_datos(texto):
+    """Prueba el modelo configurado y, si Groq ya no lo tiene, los de respaldo."""
+    ultimo_error = None
+    for modelo in MODELOS_LLM:
+        r = _groq("/chat/completions", json={
+            "model": modelo, "temperature": 0, "response_format": {"type": "json_object"},
+            "messages": [{"role": "system", "content": PROMPT_EXTRACCION.replace("__HOY__", D.hoy_lima().strftime("%d/%m/%Y"))},
+                         {"role": "user", "content": texto}]})
+        if r.status_code in (400, 404) and "model" in r.text.lower():
+            print("modelo no disponible en Groq:", modelo)
+            ultimo_error = RuntimeError(f"Groq LLM {r.status_code} (modelo {modelo}): {r.text[:120]}")
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(f"Groq LLM {r.status_code}: {r.text[:150]}")
+        contenido = r.json()["choices"][0]["message"]["content"].strip()
+        contenido = re.sub(r"^```(?:json)?|```$", "", contenido, flags=re.M).strip()
+        d = json.loads(contenido)
+        return d if isinstance(d, dict) else {}
+    raise ultimo_error or RuntimeError("Sin modelo de IA disponible")
+
+def _val(v):
+    if v is None or v == "":
+        return ""
+    if isinstance(v, bool):
+        return "SÍ" if v else "NO"
+    if isinstance(v, float) and v == int(v):
+        v = int(v)
+    if isinstance(v, list):
+        return "\n".join(str(x).strip() for x in v if str(x).strip())
+    return str(v).strip()
+
+def _pago_txt(p):
+    return f"{_val(p.get('fecha'))} / {_val(p.get('monto'))} / {_val(p.get('medio')).upper()} / {_val(p.get('op')) or '-'}"
+
+def llenar_plantilla(plantilla, datos):
+    """Rellena la plantilla con lo que extrajo la IA. Lo que no se dijo queda en blanco."""
+    pagos = [p for p in (datos.get("pagos") or []) if isinstance(p, dict)]
+    accs = [a for a in (datos.get("accesorios") or []) if isinstance(a, dict)]
+    insts = [a for a in (datos.get("instalaciones") or []) if isinstance(a, dict)]
+    inis = [x for x in (datos.get("iniciales") or []) if x not in (None, "")]
+    lineas = plantilla.split("\n")
+    def cuantas(rx):
+        return sum(1 for l in lineas if ":" in l and re.fullmatch(rx, norm_label(l.split(":", 1)[0])))
+    tot_pago, tot_acc, tot_ini = cuantas(r"PAGO\s*\d+"), cuantas(r"(ACC|ACCESORIO)\s*\d+"), cuantas(r"INICIAL\s*\d+")
+    out = []
+    for linea in lineas:
+        if ":" not in linea:
+            out.append(linea)
+            continue
+        etiqueta = linea.split(":", 1)[0]
+        et = norm_label(etiqueta)
+        if et == "TIPO":
+            out.append(linea)
+            continue
+        for rx, lista, total, fn in (
+            (r"PAGO\s*(\d+)", pagos, tot_pago, _pago_txt),
+            (r"(?:ACC|ACCESORIO)\s*(\d+)", accs, tot_acc,
+             lambda a: f"{_val(a.get('cant')) or 1} / {_val(a.get('desc'))} / {_val(a.get('pu'))}"),
+            (r"INICIAL\s*(\d+)", inis, tot_ini, lambda x: _val(x)),
+        ):
+            m = re.fullmatch(rx, et)
+            if m:
+                i = int(m.group(1)) - 1
+                out.append(f"{etiqueta}: {fn(lista[i])}" if i < len(lista) else f"{etiqueta}:")
+                if i == total - 1:   # última línea de la plantilla: agrega las que sobren
+                    base = re.sub(r"\d+", "", etiqueta).strip()
+                    for j in range(total, len(lista)):
+                        out.append(base + " " + str(j + 1) + ": " + fn(lista[j]))
+                break
+        else:
+            if re.fullmatch(r"(INSTALACION|INST)\s*\d*", et):
+                out.append(f"{etiqueta}: {_val(insts[0].get('desc'))} / {_val(insts[0].get('monto'))}" if insts else f"{etiqueta}:")
+                continue
+            clave = CAMPOS.get(et)
+            v = _val(datos.get(clave)) if clave else ""
+            if clave == "descuento" and v:
+                v = v.replace("%", "")
+            out.append(f"{etiqueta}: {v}".rstrip() if v else f"{etiqueta}:")
+    return "\n".join(out)
+
+def procesar_libre(num, texto, origen="texto"):
+    """Texto libre o nota de voz -> plantilla prellenada para que la revises y la envíes."""
+    try:
+        datos = extraer_datos(texto)
+    except Exception as ex:
+        print("error extracción:", type(ex).__name__, str(ex)[:150])
+        enviar(num, "No pude armar la plantilla automáticamente. Escribe *1* a *6* para usar las plantillas del menú.")
+        return
+    tipo = str(datos.get("tipo", "desconocido")).strip().lower()
+    if tipo not in TIPOS_IA:
+        enviar(num, "No me quedó claro qué documento necesitas (contado, separación, financiamiento, cotización o simulación). "
+                    "Dímelo, o usa el menú:\n\n" + MENU)
+        return
+    plantilla = llenar_plantilla(TIPOS_IA[tipo], datos)
+    enviar(num, "📝 Preparé esta plantilla con lo que entendí. *Revísala* (la IA puede equivocarse), corrige lo que haga "
+                "falta, completa lo que quedó en blanco y *envíamela de vuelta* 👇")
+    enviar(num, plantilla)
+
+def atender_audio(num, m):
+    if not GROQ_API_KEY:
+        enviar(num, "La función de notas de voz todavía no está activada. Escribe el mensaje o usa el menú.")
+        return
+    try:
+        audio = descargar_media(m["audio"]["id"])
+        texto = transcribir(audio)
+    except Exception as ex:
+        print("error audio:", type(ex).__name__, str(ex)[:150])
+        enviar(num, "⚠️ No pude entender el audio (o se alcanzó el límite del servicio de voz). "
+                    "Intenta de nuevo en un minuto o escríbelo.")
+        return
+    if not texto:
+        enviar(num, "No logré escuchar nada en el audio. Intenta de nuevo, hablando más cerca del micrófono.")
+        return
+    enviar(num, f"🎙️ Entendí:\n«{texto}»")
+    procesar_libre(num, texto, "voz")
+
 def descargar_media(media_id):
     h = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     r = requests.get(f"{GRAPH}/{media_id}", headers=h, timeout=15)
@@ -745,13 +917,15 @@ def atender(num, texto):
         clave = t if t in PLANTILLAS else {"CONTADO": "1", "SEPARACION": "2"}[t]
         enviar(num, "Perfecto. Copia el siguiente mensaje, complétalo y envíamelo 👇")
         enviar(num, PLANTILLAS[clave])
+    elif GROQ_API_KEY and len(texto.strip()) >= 30 and re.search(r"\d", texto):
+        procesar_libre(num, texto)
     else:
         enviar(num, MENU)
 
 @app.get("/")
 def home():
     ok = COT.FUENTES_OK and D.FUENTES_OK
-    return "Bot Leo Motos activo ✅ (Prueba 5) – Fuentes: " + ("OK ✅" if ok else "FALTAN ⚠️ (sube la carpeta fonts completa)")
+    return "Bot Leo Motos activo ✅ (Prueba 6) – Fuentes: " + ("OK ✅" if ok else "FALTAN ⚠️ (sube la carpeta fonts completa)")
 
 @app.get("/webhook")
 def verificar():
@@ -778,6 +952,9 @@ def recibir():
                         continue
                     if m.get("type") == "image":
                         atender_imagen(num, m)
+                        continue
+                    if m.get("type") == "audio":
+                        atender_audio(num, m)
                         continue
                     if m.get("type") != "text":
                         enviar(num, "Por ahora solo leo texto y fotos 🙂")
